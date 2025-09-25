@@ -132,3 +132,6 @@ dmypy.json
 .github/actions-hub
 
 .idea/
+
+# RGi
+*.db
