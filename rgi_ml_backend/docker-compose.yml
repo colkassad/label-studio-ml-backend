@@ -36,6 +36,9 @@ services:
       # Determine the actual IP using 'ifconfig' (Linux/Mac) or 'ipconfig' (Windows).
       - LABEL_STUDIO_URL=https://redshifted.org
       - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
+      - LOG_SELECTED_LABEL=1
+      - DEFAULT_POLY_LABEL=car
+      - POLY_MIN_AREA_PX=25
     env_file:
       - .env
     ports:

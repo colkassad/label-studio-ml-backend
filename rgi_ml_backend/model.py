@@ -2,7 +2,7 @@ import os
 import sys
 from typing import List, Dict, Optional
 from uuid import uuid4
-
+import logging
 import numpy as np
 import torch
 from PIL import Image
@@ -20,6 +20,7 @@ sys.path.insert(0, ROOT_DIR)
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+LOG_SELECTED_LABEL = os.getenv("LOG_SELECTED_LABEL", "0") not in ("0", "false", "False")
 
 # ----------------------
 # Runtime configuration
@@ -92,24 +93,67 @@ class NewModel(LabelStudioMLBase):
             mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
         return mask
 
-    def _selected_polygon_label(self, context: Dict, poly_from_name: str) -> str:
+    def _selected_polygon_label(self, context: Dict, poly_from_name: str, fallback: str) -> str:
         """
-        Try the canonical places Label Studio puts the active label for PolygonLabels.
-        Fallback to DEFAULT_POLY_LABEL.
+        Try several LS context shapes to extract the active class for PolygonLabels.
+        If nothing matches, return fallback.
         """
-        # 1) Most common: dict keyed by from_name (e.g., {'labels': ['car']})
-        for key in ('selectedLabels', 'selected_labels'):
-            sel = context.get(key)
-            if isinstance(sel, dict):
-                for fk in (poly_from_name, 'labels'):
-                    v = sel.get(fk)
-                    if isinstance(v, list) and v:
-                        return str(v[0])
-            elif isinstance(sel, list) and sel:
-                return str(sel[0])
+        def pick_first_list_val(obj, keys):
+            for k in keys:
+                v = obj.get(k)
+                if isinstance(v, list) and v:
+                    return str(v[0])
+            return None
 
-        # 2) Very defensive fallback
-        return DEFAULT_POLY_LABEL
+        # 0) Sometimes the LS UI sends it flat (list of strings)
+        for k in ("selectedLabels", "selected_labels"):
+            v = context.get(k)
+            if isinstance(v, list) and v and isinstance(v[0], str):
+                if LOG_SELECTED_LABEL:
+                    logging.getLogger(__name__).debug(f"[SAM2] selected via {k} (flat list): {v[0]}")
+                return str(v[0])
+
+        # 1) Canonical dict keyed by from_name, e.g. {'labels': ['tree']}
+        for k in ("selectedLabels", "selected_labels"):
+            v = context.get(k)
+            if isinstance(v, dict):
+                # exact from_name
+                if poly_from_name in v and isinstance(v[poly_from_name], list) and v[poly_from_name]:
+                    if LOG_SELECTED_LABEL:
+                        logging.getLogger(__name__).debug(f"[SAM2] selected via {k}[{poly_from_name}]: {v[poly_from_name][0]}")
+                    return str(v[poly_from_name][0])
+                # common generic keys
+                cand = pick_first_list_val(v, ("labels", "polygonlabels", "choices", "value"))
+                if cand:
+                    if LOG_SELECTED_LABEL:
+                        logging.getLogger(__name__).debug(f"[SAM2] selected via {k} generic key: {cand}")
+                    return cand
+
+        # 2) Some builds send a list of dicts like [{'from_name':'labels','labels':['tree']}]
+        for k in ("selectedLabels", "selected_labels"):
+            v = context.get(k)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        if item.get("from_name") in (poly_from_name, "labels"):
+                            cand = pick_first_list_val(item, ("labels", "polygonlabels", "choices", "value"))
+                            if cand:
+                                if LOG_SELECTED_LABEL:
+                                    logging.getLogger(__name__).debug(f"[SAM2] selected via {k} list-of-dicts: {cand}")
+                                return cand
+
+        # 3) Last resort: sometimes the active choice is echoed in context.result (rare)
+        for r in context.get("result", []):
+            if r.get("from_name") == poly_from_name and isinstance(r.get("value"), dict):
+                cand = pick_first_list_val(r["value"], ("polygonlabels", "labels", "choices"))
+                if cand:
+                    if LOG_SELECTED_LABEL:
+                        logging.getLogger(__name__).debug(f"[SAM2] selected via context.result: {cand}")
+                    return cand
+
+        if LOG_SELECTED_LABEL:
+            logging.getLogger(__name__).debug(f"[SAM2] no active label found; using fallback '{fallback}'")
+        return fallback
 
     # ---------- geometry ----------
     def masks_to_polygons(
@@ -244,10 +288,10 @@ class NewModel(LabelStudioMLBase):
                 input_box = [int(round(fx)), int(round(fy)), int(round(fx + w)), int(round(fy + h))]
 
         # Which class to use for polygon?
-        selected_label = self._selected_polygon_label(context, poly_from)
+        selected_label = self._selected_polygon_label(context, poly_from, fallback=os.getenv('DEFAULT_POLY_LABEL', 'car'))
+
         # Log for debugging
         try:
-            import logging
             logging.getLogger(__name__).debug(
                 f"[SAM2] selected_label='{selected_label}', "
                 f"points={len(point_coords)}, box={'yes' if input_box is not None else 'no'}"
