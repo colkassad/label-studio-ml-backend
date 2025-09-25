@@ -4,12 +4,9 @@ import json
 import logging
 import logging.config
 
-# Set a default log level if LOG_LEVEL is not defined
-log_level = os.getenv("LOG_LEVEL", "INFO")
-
 logging.config.dictConfig({
   "version": 1,
-  "disable_existing_loggers": False,  # Prevent overriding existing loggers
+  "disable_existing_loggers": False,
   "formatters": {
     "standard": {
       "format": "[%(asctime)s] [%(levelname)s] [%(name)s::%(funcName)s::%(lineno)d] %(message)s"
@@ -18,13 +15,13 @@ logging.config.dictConfig({
   "handlers": {
     "console": {
       "class": "logging.StreamHandler",
-      "level": log_level,
+      "level": os.getenv('LOG_LEVEL'),
       "stream": "ext://sys.stdout",
       "formatter": "standard"
     }
   },
   "root": {
-    "level": log_level,
+    "level": os.getenv('LOG_LEVEL'),
     "handlers": [
       "console"
     ],
@@ -63,7 +60,7 @@ if __name__ == "__main__":
         '-d', '--debug', dest='debug', action='store_true',
         help='Switch debug mode')
     parser.add_argument(
-        '--log-level', dest='log_level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default=log_level,
+        '--log-level', dest='log_level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default=None,
         help='Logging level')
     parser.add_argument(
         '--model-dir', dest='model_dir', default=os.path.dirname(__file__),
