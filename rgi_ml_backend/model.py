@@ -235,93 +235,100 @@ class NewModel(LabelStudioMLBase):
             'probs': [prob]
         }
 
-    # ----------------------
-    # Main prediction entry
-    # ----------------------
-    def predict(self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs) -> ModelResponse:
-        """
-        Returns the predicted polygon(s) for an interactive point/box placed in Label Studio.
-        """
-        try:
-            from_name, to_name, value, control_type = self._get_polygon_or_brush_control()
-        except Exception:
-            # If nothing found at all, bail gracefully
-            return ModelResponse(predictions=[])
+# --- inside NewModel class ---
 
-        if not context or not context.get('result'):
-            # no interaction yet
-            return ModelResponse(predictions=[])
+def _pick_polygon_control(self):
+    # Always return the polygon control; raise if missing
+    return self.get_first_tag_occurence('PolygonLabels', 'Image')  # (from_name, to_name, value)
 
-        image_width = context['result'][0]['original_width']
-        image_height = context['result'][0]['original_height']
+def _find_prompt_tags(self):
+    kp = None
+    box = None
+    try:
+        kp = self.get_first_tag_occurence('KeyPointLabels', 'Image')[0]  # from_name for points
+    except Exception:
+        pass
+    try:
+        box = self.get_first_tag_occurence('RectangleLabels', 'Image')[0]  # from_name for boxes
+    except Exception:
+        pass
+    return kp, box
 
-        # Collect interaction context
-        point_coords = []
-        point_labels = []
-        input_box = None
-        selected_label = None
+def _selected_polygon_label(self, context, poly_from_name, default_label="Object"):
+    """
+    Try to read the currently selected PolygonLabels class from context.
+    LS often supplies selected labels in a mapping like selectedLabels.
+    Fallback to default_label if we can't find it.
+    """
+    # 1) Most common: a dict of arrays keyed by from_name
+    for key in ('selectedLabels', 'selected_labels'):
+        sl = context.get(key)
+        if isinstance(sl, dict):
+            vals = sl.get(poly_from_name) or next(iter(sl.values()), [])
+            if isinstance(vals, list) and vals:
+                return vals[0]
+    # 2) Legacy/unknown: try a flat list
+    if isinstance(context.get('selectedLabels'), list) and context['selectedLabels']:
+        return context['selectedLabels'][0]
+    return default_label
 
-        for ctx in context['result']:
-            x = ctx['value']['x'] * image_width / 100.0
-            y = ctx['value']['y'] * image_height / 100.0
-            ctx_type = ctx['type']
+def predict(self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs) -> ModelResponse:
+    # Require interaction data
+    if not context or not context.get('result'):
+        return ModelResponse(predictions=[])
 
-            # Label chosen by the user (from the tool they used)
-            # Works for keypointlabels/rectanglelabels, etc.
-            if ctx['value'].get(ctx_type):
-                selected_label = ctx['value'][ctx_type][0]
+    # Output control (PolygonLabels)
+    poly_from, to_name, value = self._pick_polygon_control()
 
-            if ctx_type == 'keypointlabels':
-                point_labels.append(int(ctx.get('is_positive', 0)))
-                point_coords.append([int(round(x)), int(round(y))])
-            elif ctx_type == 'rectanglelabels':
-                box_width = ctx['value']['width'] * image_width / 100.0
-                box_height = ctx['value']['height'] * image_height / 100.0
-                input_box = [
-                    int(round(x)),
-                    int(round(y)),
-                    int(round(x + box_width)),
-                    int(round(y + box_height))
-                ]
+    # Prompt tools (points/box)
+    kp_from, box_from = self._find_prompt_tags()
 
-        img_url = tasks[0]['data'][value]
-        predictor_results = self._sam_predict(
-            img_url=img_url,
-            point_coords=point_coords or None,
-            point_labels=point_labels or None,
-            input_box=input_box,
-            task=tasks[0]
-        )
+    image_width = context['result'][0]['original_width']
+    image_height = context['result'][0]['original_height']
 
-        masks = predictor_results['masks']
-        probs = predictor_results['probs']
+    # Collect prompts
+    point_coords, point_labels, input_box = [], [], None
+    for r in context['result']:
+        t = r['type']
+        x = r['value']['x'] * image_width / 100.0
+        y = r['value']['y'] * image_height / 100.0
 
-        # If we have a polygon control, return polygons; otherwise brush fallback
-        if control_type == 'PolygonLabels':
-            poly_results = self.masks_to_polygons(
-                masks=masks,
-                probs=probs,
-                width=image_width,
-                height=image_height,
-                from_name=from_name,
-                to_name=to_name,
-                label=selected_label or 'Object'
-            )
-            avg_score = float(np.mean(probs)) if len(probs) else 0.0
-            predictions = [{
-                'result': poly_results,
-                'model_version': self.get('model_version'),
-                'score': avg_score
-            }]
-        else:
-            predictions = self.get_results_brush(
-                masks=masks,
-                probs=probs,
-                width=image_width,
-                height=image_height,
-                from_name=from_name,
-                to_name=to_name,
-                label=selected_label or 'Object'
-            )
+        # Only collect from our prompt tools
+        if t == 'keypointlabels' and (kp_from is None or r.get('from_name') == kp_from):
+            point_labels.append(int(r.get('is_positive', 0)))
+            point_coords.append([int(round(x)), int(round(y))])
 
-        return ModelResponse(predictions=predictions)
+        elif t == 'rectanglelabels' and (box_from is None or r.get('from_name') == box_from):
+            w = r['value']['width'] * image_width / 100.0
+            h = r['value']['height'] * image_height / 100.0
+            input_box = [int(round(x)), int(round(y)), int(round(x + w)), int(round(y + h))]
+
+    # Which class should the returned polygon use?
+    selected_label = self._selected_polygon_label(context, poly_from, default_label=os.getenv('DEFAULT_POLY_LABEL', 'Object'))
+
+    # Run SAM2
+    img_url = tasks[0]['data'][value]
+    predictor_results = self._sam_predict(
+        img_url=img_url,
+        point_coords=point_coords or None,
+        point_labels=point_labels or None,
+        input_box=input_box,
+        task=tasks[0]
+    )
+
+    # Convert mask -> polygons (uses the masks_to_polygons method from the version I sent)
+    poly_results = self.masks_to_polygons(
+        masks=predictor_results['masks'],
+        probs=predictor_results['probs'],
+        width=image_width,
+        height=image_height,
+        from_name=poly_from,
+        to_name=to_name,
+        label=selected_label
+    )
+    avg_score = float(np.mean(predictor_results['probs'])) if predictor_results['probs'] else 0.0
+    return ModelResponse(predictions=[{
+        'result': poly_results,
+        'model_version': self.get('model_version'),
+        'score': avg_score
+    }])
